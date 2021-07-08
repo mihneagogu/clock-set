@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, MutexGuard};
 
 struct LockNode<T: Hash + PartialEq> {
@@ -20,6 +20,18 @@ impl<T: Hash + PartialEq> LockNode<T> {
         // Known limitation. We use 0 as a marker node for the head.
         // We could get around this using a signed type but Hasher uses unsigned types,
         // so this is a bit unlucky
+        if key == 0 {
+            panic!("Hashcodes of your value must always be non-zero");
+        }
+        LockNode {
+            key,
+            val: Some(val),
+            next: None,
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn new_with_key(val: T, key: u64) -> Self {
         if key == 0 {
             panic!("Hashcodes of your value must always be non-zero");
         }
@@ -63,16 +75,37 @@ fn calc_hash<T: Hash>(t: &T) -> u64 {
     hasher.finish()
 }
 
+unsafe impl<T: Hash + PartialEq> Send for CSet<T> {}
+unsafe impl<T: Hash + PartialEq> Sync for CSet<T> {}
+
 pub struct CSet<T: Hash + PartialEq> {
     size: AtomicUsize,
     head: UnsafeCell<LockNode<T>>,
+}
+
+impl<T: Hash + PartialEq> Drop for CSet<T> {
+    fn drop(&mut self) {
+        let head = self.head.get();
+        let mut next = unsafe { (*head).next };
+        loop {
+            if let Some(node_ptr) = next {
+                // SAFETY: All pointers are from leaked valid boxes
+                unsafe {
+                    next = node_ptr.as_ref().next;
+                    let _ = Box::from_raw(node_ptr.as_ptr());
+                };
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl<T: Hash + PartialEq> CSet<T> {
     pub fn new() -> Self {
         let tail = Box::into_raw(Box::new(LockNode::<T>::marker(u64::MAX)));
         let mut head = LockNode::marker(u64::MIN);
-        // SAFETY: tail is a valid pointer as per the construction of Box
+        // SAFETY: All pointers are from leaked valid boxes
         head.next = unsafe { Some(NonNull::new_unchecked(tail)) };
         Self {
             size: AtomicUsize::new(0),
@@ -80,8 +113,35 @@ impl<T: Hash + PartialEq> CSet<T> {
         }
     }
 
+    fn assert_ordered() {}
+
+    pub fn print<F>(&mut self, printer: F)
+    where
+        F: Fn(&T),
+    {
+        let head = self.head.get();
+        // SAFETY: All pointers are from leaked valid boxes
+        let mut next = unsafe { (*head).next };
+        loop {
+            if let Some(node_ptr) = next {
+                // SAFETY: All pointers are from leaked valid boxes
+                unsafe {
+                    if let Some(v) = &(*node_ptr.as_ptr()).val {
+                        printer(v);
+                    }
+                    next = node_ptr.as_ref().next;
+                };
+            } else {
+                println!();
+                break;
+            }
+        }
+    }
+
     pub fn size(&self) -> usize {
-        self.size.load(SeqCst)
+        // We are not using the atomic for any inter-thread communication,
+        // just using it as a counter, so Relaxed ordering will do
+        self.size.load(Relaxed)
     }
 
     fn find(
@@ -92,19 +152,20 @@ impl<T: Hash + PartialEq> CSet<T> {
         (ManuallyDrop<MutexGuard<'_, ()>>, *mut LockNode<T>),
     ) {
         // SAFETY: We never cast the pointer to a mutable reference or shared reference.
-        // All of the changes to the nodes are done explicitly when holding the locks
+        // All of the changes to the nodes are done explicitly when holding the locks,
+        // and we know the very first node is always the head marker node
         let mut prev = self.head.get();
-        // Safety we know the pointer was created using a box
+        // SAFETY: All pointers are from leaked valid boxes
         let mut prev_lock = ManuallyDrop::new(unsafe { (*prev).lock.lock().unwrap() });
 
         let mut curr = unsafe { (*prev).next }.as_ref().unwrap().as_ptr();
-        // SAFETY: We know the pointer was created using a box
+        // SAFETY: All pointers are from leaked valid boxes
         let mut curr_lock = ManuallyDrop::new(unsafe { (*curr).lock.lock().unwrap() });
 
         loop {
-            // SAFETY: Same as above
+            // SAFETY: All pointers are from leaked valid boxes
             if unsafe { (*curr).key } >= key {
-                return((prev_lock, prev), (curr_lock, curr));
+                return ((prev_lock, prev), (curr_lock, curr));
             }
             // Release the first lock we are holding, while keeping the second one
             let _ = ManuallyDrop::into_inner(prev_lock);
@@ -117,36 +178,134 @@ impl<T: Hash + PartialEq> CSet<T> {
         }
     }
 
-    pub fn contains(_like: &T) {}
-    pub fn remove(_like: &T) {}
+    pub fn contains_with_key(&self, key: u64) -> bool {
+        let ((prev_lock, _), (curr_lock, curr)) = self.find(key);
+        // SAFETY: All pointers are from leaked valid boxes
+        let is_inside = unsafe { (*curr).key } == key;
+        let _ = ManuallyDrop::into_inner(prev_lock);
+        let _ = ManuallyDrop::into_inner(curr_lock);
+        is_inside
+    }
 
-    pub fn insert(&self, val: T) -> bool {
-        let key = calc_hash(&val);
-        let mut to_insert = LockNode::new(val);
+    pub fn contains(&self, like: &T) -> bool {
+        self.contains_with_key(calc_hash(like))
+    }
+
+    pub fn remove(&self, like: &T) -> bool {
+        self.remove_with_key(calc_hash(like))
+    }
+    pub fn remove_with_key(&self, key: u64) -> bool {
+        let ((prev_lock, prev), (curr_lock, curr)) = self.find(key);
+        // SAFETY: All pointers are from leaked valid boxes
+        if unsafe { (*curr).key } > key {
+            // The item isn't in the set
+            let _ = ManuallyDrop::into_inner(prev_lock);
+            let _ = ManuallyDrop::into_inner(curr_lock);
+            return false;
+        }
+        // The node is in the set, delete it
+
+        // SAFETY: All pointers are from leaked valid boxes
+        unsafe {
+            let next_next = (*curr).next.unwrap().as_ptr();
+            (*prev).next = Some(NonNull::new_unchecked(next_next));
+        }
+
+        // The decrement is before the release of the locks for the same reason as
+        // mentioned in insert_with_key()
+        self.size.fetch_sub(1, Relaxed);
+        let _ = ManuallyDrop::into_inner(prev_lock);
+        let _ = ManuallyDrop::into_inner(curr_lock);
+        // SAFETY: curr is no longer needed, and we never gave any references to it
+        // so it is safe to free it. It is mandatory as we do this here,
+        // as curr_lock is a guard from "curr", so doing this in reverse order
+        // would use-after-free
+        let _ = unsafe { Box::from_raw(curr) };
+
+        true
+    }
+
+    pub fn insert_with_key(&self, val: T, key: u64) -> bool {
+        let mut to_insert = LockNode::new_with_key(val, key);
 
         let ((prev_lock, prev), (curr_lock, curr)) = self.find(key);
-        if unsafe { (*prev).key } == key {
+        if unsafe { (*curr).key } == key {
             // The value is already in the set
             let _ = ManuallyDrop::into_inner(prev_lock);
             let _ = ManuallyDrop::into_inner(curr_lock);
             return false;
         }
         // The value isn't in the set, but we add it inbetween the two nodes that we got
+        // SAFETY: All pointers are from leaked valid boxes
         to_insert.next = Some(unsafe { NonNull::new_unchecked(curr) });
         let to_insert = Box::into_raw(Box::new(to_insert));
 
         // SAFETY: The casting from *mut to &mut only ever happens once, here.
         // We are guaranteed that no other thread makes this operation at the same time as us,
         // as we are the ones holding these two locks at the same time, so we are the only
-        // ones using a &mut to this specific node, so there is no aliasing going on.
-        let prev_mut = unsafe { &mut (*prev).next };
+        // ones using a &mut to this specific node. More specifically, we are the only thread
+        // creating a reference (mutable or not), because we only do this once we hold both nodes'
+        // locks
+        let prev_next_mut = unsafe { &mut (*prev).next };
         // Put our node in the middle
-        *prev_mut = Some(unsafe { NonNull::new_unchecked(to_insert) });
+        // SAFETY: All pointers are from leaked valid boxes
+        *prev_next_mut = Some(unsafe { NonNull::new_unchecked(to_insert) });
 
+        // We are not using the atomic for any inter-thread communication,
+        // just using it as a counter, so Relaxed ordering will do here.
+        // We put the increment here, as it could be the very unlucky case that 
+        // someone deletes the node we just added right after the lock release before the increment
+        // which would be inconsistent, so it must happen before the release of the locks
+        self.size.fetch_add(1, Relaxed);
         let _ = ManuallyDrop::into_inner(prev_lock);
         let _ = ManuallyDrop::into_inner(curr_lock);
-        self.size.fetch_add(1, SeqCst);
 
         true
+    }
+
+    pub fn insert(&self, val: T) -> bool {
+        let key = calc_hash(&val);
+        self.insert_with_key(val, key)
+    }
+}
+
+fn main() {
+    use std::sync::Arc;
+    use std::thread;
+    let set = Arc::new(CSet::new());
+
+    let mut ts = vec![];
+    for _ in 1..2 {
+        for i in 1..=200 {
+            let s = Arc::clone(&set);
+            let handle = thread::spawn(move || {
+                s.insert_with_key(i, i);
+            });
+            ts.push(handle);
+        }
+    }
+    for jh in ts.into_iter() {
+        let _ = jh.join();
+    }
+    println!("Size: {}", set.size());
+    let mut ts = vec![];
+    for i in 1..=200 {
+        if i % 2 == 0 {
+            let s = Arc::clone(&set);
+            let handle = thread::spawn(move || {
+                s.remove_with_key(i);
+            });
+            ts.push(handle);
+        }
+    }
+    for jh in ts.into_iter() {
+        let _ = jh.join();
+    }
+    println!("Size: {}", set.size());
+    let set = Arc::try_unwrap(set);
+    if let Ok(mut set) = set {
+        set.print(|i| print!("{} ", i));
+    } else {
+        unreachable!()
     }
 }
