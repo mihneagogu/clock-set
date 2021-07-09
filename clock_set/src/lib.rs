@@ -1,3 +1,25 @@
+/// This is just a proof of concept example
+/// of a concurrent linked list implementation
+/// that can be used as a set (membership is 
+/// validated via "keys", which MUST be unique). 
+/// Alternatively, we could also check object equality instead of only 
+/// the keys, but that detail is relatively unimportant compared to the concept.
+/// The key thing here is that we are totally circumventing the borrow-checker 
+/// to lock in a "hand over hand" fashion. We make sure that all of the
+/// accesses to the pointers are synchronized via the locks, but the compiler 
+/// has no way of understanding that (hence the use of raw pointers).
+/// This is one of the examples where unsafe is necessary. The compiler cannot
+/// tell that the very specific lock ordering we are doing guarantees that all accesses
+/// are synchronized. The Mutex<()> is just a blank mutex for synchronization.
+/// We could have used Mutex<LockNode<>>, but then we would have had to also wrap it
+/// in an Arc, which seems unnecessary.
+///
+/// Linked lists are notorious for being awkward in Rust, and this is just an implementation
+/// to experiment with unsafe and the kinds of things we can do with it.
+/// Possibly hardest part of unsafe Rust is creating references from pointers,
+/// to make sure we do not violate any of the aliasing rules. There is great care
+/// in here to prevent that, as references are created ONLY when both locks are held
+/// (i.e no other thread could be possibly doing the same thing at the same time as us).
 use std::cell::UnsafeCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -86,6 +108,7 @@ pub struct CSet<T: Hash + PartialEq> {
 impl<T: Hash + PartialEq> Drop for CSet<T> {
     fn drop(&mut self) {
         let head = self.head.get();
+        // SAFETY: All pointers are from leaked valid boxes
         let mut next = unsafe { (*head).next };
         loop {
             if let Some(node_ptr) = next {
@@ -113,7 +136,6 @@ impl<T: Hash + PartialEq> CSet<T> {
         }
     }
 
-    fn assert_ordered() {}
 
     pub fn print<F>(&mut self, printer: F)
     where
@@ -158,6 +180,7 @@ impl<T: Hash + PartialEq> CSet<T> {
         // SAFETY: All pointers are from leaked valid boxes
         let mut prev_lock = ManuallyDrop::new(unsafe { (*prev).lock.lock().unwrap() });
 
+        // SAFETY: All pointers are from leaked valid boxes
         let mut curr = unsafe { (*prev).next }.as_ref().unwrap().as_ptr();
         // SAFETY: All pointers are from leaked valid boxes
         let mut curr_lock = ManuallyDrop::new(unsafe { (*curr).lock.lock().unwrap() });
@@ -229,6 +252,7 @@ impl<T: Hash + PartialEq> CSet<T> {
         let mut to_insert = LockNode::new_with_key(val, key);
 
         let ((prev_lock, prev), (curr_lock, curr)) = self.find(key);
+        // SAFETY: All pointers are from leaked valid boxes
         if unsafe { (*curr).key } == key {
             // The value is already in the set
             let _ = ManuallyDrop::into_inner(prev_lock);
@@ -266,46 +290,5 @@ impl<T: Hash + PartialEq> CSet<T> {
     pub fn insert(&self, val: T) -> bool {
         let key = calc_hash(&val);
         self.insert_with_key(val, key)
-    }
-}
-
-fn main() {
-    use std::sync::Arc;
-    use std::thread;
-    let set = Arc::new(CSet::new());
-
-    let mut ts = vec![];
-    for _ in 1..2 {
-        for i in 1..=200 {
-            let s = Arc::clone(&set);
-            let handle = thread::spawn(move || {
-                s.insert_with_key(i, i);
-            });
-            ts.push(handle);
-        }
-    }
-    for jh in ts.into_iter() {
-        let _ = jh.join();
-    }
-    println!("Size: {}", set.size());
-    let mut ts = vec![];
-    for i in 1..=200 {
-        if i % 2 == 0 {
-            let s = Arc::clone(&set);
-            let handle = thread::spawn(move || {
-                s.remove_with_key(i);
-            });
-            ts.push(handle);
-        }
-    }
-    for jh in ts.into_iter() {
-        let _ = jh.join();
-    }
-    println!("Size: {}", set.size());
-    let set = Arc::try_unwrap(set);
-    if let Ok(mut set) = set {
-        set.print(|i| print!("{} ", i));
-    } else {
-        unreachable!()
     }
 }

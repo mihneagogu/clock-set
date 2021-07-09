@@ -2,7 +2,6 @@ use clock_set;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::clock_set::*;
     use std::sync::Arc;
     use std::thread;
@@ -63,6 +62,43 @@ mod tests {
             assert_eq!(set.size(), 100);
         } else {
             unreachable!()
+        }
+    }
+
+    #[test]
+    /// This test is to be used in Miri. We just make a bunch of concurrent
+    /// operations and ensure that nothing blows up
+    fn multiple_operations_run_normally() {
+        let set = Arc::new(CSet::<u32>::new());
+        insert_200(&set);
+        let mut ts = vec![];
+        for round in 1..=5 {
+            for i in 1..=200 {
+                let s = Arc::clone(&set);
+                match round {
+                    1 | 3 => {
+                        let handle = thread::spawn(move || {
+                            s.insert_with_key(i, i as u64);
+                        });
+                        ts.push(handle);
+                    }
+                    2 | 4 => {
+                        let handle = thread::spawn(move || {
+                            s.remove_with_key(i as u64);
+                        });
+                        ts.push(handle);
+                    }
+                    _ => {
+                        let handle = thread::spawn(move || {
+                            s.contains_with_key(i as u64);
+                        });
+                        ts.push(handle);
+                    }
+                }
+            }
+        }
+        for jh in ts.into_iter() {
+            assert!(jh.join().is_ok());
         }
     }
 }
